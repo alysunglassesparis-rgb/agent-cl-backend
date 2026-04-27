@@ -24,14 +24,13 @@ def serial_to_year_month(serial):
 def build_lookup(ws):
     """
     Crée un dictionnaire qui pointe vers l'OBJET cellule de la colonne Qty (N).
-    On utilise le nom du produit (colonne E) comme clé.
     """
     lookup = {}
     for row in ws.iter_rows(min_row=2):
         name_cell = row[4] # Colonne E (Index 4)
         if name_cell.value:
             key = str(name_cell.value).strip().upper()
-            # On cible la cellule de la colonne N (Index 13) pour la quantité
+            # On stocke la cellule de la colonne N (Index 13) pour la modifier plus tard
             lookup[key] = row[13] 
     return lookup
 
@@ -60,16 +59,15 @@ def process():
         if not f1 or not f2 or not f3:
             return jsonify({"error": "3 fichiers requis"}), 400
 
-        # --- CONFIGURATION CRUCIALE POUR LES IMAGES NUORDER ---
-        # keep_vba=True est souvent nécessaire pour les fichiers NuORDER car ils 
-        # contiennent des structures de données complexes que le mode standard ignore.
-        # On ne met surtout pas data_only=True car cela détruit les images.
+        # --- CONFIGURATION POUR GARDER LES IMAGES ---
+        # keep_vba=True est indispensable ici pour préserver les conteneurs d'images 
+        # dans les fichiers Excel générés par des outils comme NuORDER.
         wb1 = openpyxl.load_workbook(f1)
         wb2 = openpyxl.load_workbook(f2, keep_vba=True)
         wb3 = openpyxl.load_workbook(f3, keep_vba=True)
 
         ws1 = wb1.active
-        # Identification des feuilles de données NuORDER
+        # Identification des feuilles NuORDER
         sn2 = 'NuORDER Order Data' if 'NuORDER Order Data' in wb2.sheetnames else wb2.sheetnames[0]
         sn3 = 'NuORDER Order Data' if 'NuORDER Order Data' in wb3.sheetnames else wb3.sheetnames[0]
         ws2 = wb2[sn2]
@@ -78,7 +76,7 @@ def process():
         lookup2 = build_lookup(ws2)
         lookup3 = build_lookup(ws3)
 
-        # Détection de la ligne de début des données sur le bon de commande
+        # Détection du début des données sur le bon de commande
         data_start = 11
         for i, row in enumerate(ws1.iter_rows(min_row=1, max_row=25), start=1):
             if row[0].value and 'REFERENCE' in str(row[0].value).upper():
@@ -95,7 +93,6 @@ def process():
                 continue
 
             style = month = None
-            # Conversion de la date ou du texte en Style/Mois
             if hasattr(cell_a.value, 'year'):
                 style, month = str(cell_a.value.year), cell_a.value.month
             elif isinstance(cell_a.value, (int, float)) and cell_a.value > 1000:
@@ -110,7 +107,7 @@ def process():
             qty = cell_b.value if cell_b.value not in (None, '', 0) else 1
             found = False
 
-            # Recherche dans Optique
+            # Recherche dans catalogue Optique
             for cand in optic_candidates(style, month):
                 if cand.upper() in lookup2:
                     lookup2[cand.upper()].value = qty
@@ -118,7 +115,7 @@ def process():
                     found = True
                     break
 
-            # Recherche dans Solaire
+            # Recherche dans catalogue Solaire
             if not found:
                 for cand in sun_candidates(style, month):
                     if cand.upper() in lookup3:
@@ -127,7 +124,6 @@ def process():
                         found = True
                         break
 
-            # Marquage si non trouvé
             if not found:
                 not_found += 1
                 red_refs.append(f"{style}-{month}")
@@ -135,19 +131,17 @@ def process():
                     cell.fill = RED_FILL
                 row[2].value = '⚠ INTROUVABLE'
 
-        # Sauvegarde dans les buffers
+        # Sauvegarde en mémoire
         buf1 = io.BytesIO(); wb1.save(buf1); buf1.seek(0)
         buf2 = io.BytesIO(); wb2.save(buf2); buf2.seek(0)
         buf3 = io.BytesIO(); wb3.save(buf3); buf3.seek(0)
 
+        # Création du ZIP final
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, 'w') as zf:
-            name1 = f1.filename.replace('.xlsx','') + '_traite.xlsx'
-            name2 = f2.filename.replace('.xlsx','') + '_MAJ.xlsx'
-            name3 = f3.filename.replace('.xlsx','') + '_MAJ.xlsx'
-            zf.writestr(name1, buf1.read())
-            zf.writestr(name2, buf2.read())
-            zf.writestr(name3, buf3.read())
+            zf.writestr(f1.filename.replace('.xlsx','') + '_traite.xlsx', buf1.read())
+            zf.writestr(f2.filename.replace('.xlsx','') + '_MAJ.xlsx', buf2.read())
+            zf.writestr(f3.filename.replace('.xlsx','') + '_MAJ.xlsx', buf3.read())
         zip_buf.seek(0)
 
         response = send_file(zip_buf, mimetype='application/zip', as_attachment=True, download_name='resultats.zip')
