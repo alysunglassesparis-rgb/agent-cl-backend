@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+# On expose les headers pour que le front-end puisse lire les stats
 CORS(app, expose_headers=['X-Found-Optic','X-Found-Sun','X-Not-Found','X-Red-Refs'])
 
 RED_FILL = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
@@ -21,12 +22,17 @@ def serial_to_year_month(serial):
     return d.year, d.month
 
 def build_lookup(ws):
+    """
+    Crée un dictionnaire qui pointe vers l'OBJET cellule et non juste la valeur.
+    Cela permet de modifier le fichier original sans le reconstruire.
+    """
     lookup = {}
     for row in ws.iter_rows(min_row=2):
-        name_cell = row[4]
+        name_cell = row[4] # Colonne E (index 4)
         if name_cell.value:
             key = str(name_cell.value).strip().upper()
-            lookup[key] = row[13]
+            # On stocke l'OBJET cellule de destination (colonne N / index 13)
+            lookup[key] = row[13] 
     return lookup
 
 def optic_candidates(style, month):
@@ -54,9 +60,12 @@ def process():
         if not f1 or not f2 or not f3:
             return jsonify({"error": "3 fichiers requis"}), 400
 
-        wb1 = openpyxl.load_workbook(f1, keep_vba=False)
-        wb2 = openpyxl.load_workbook(f2, keep_vba=False)
-        wb3 = openpyxl.load_workbook(f3, keep_vba=False)
+        # --- CORRECTION CRUCIALE POUR LES IMAGES ---
+        # On charge les workbooks normalement sans data_only=True. 
+        # Openpyxl préserve les images par défaut lors de la sauvegarde s'ils sont ouverts ainsi.
+        wb1 = openpyxl.load_workbook(f1)
+        wb2 = openpyxl.load_workbook(f2)
+        wb3 = openpyxl.load_workbook(f3)
 
         ws1 = wb1.active
         sn2 = 'NuORDER Order Data' if 'NuORDER Order Data' in wb2.sheetnames else wb2.sheetnames[0]
@@ -67,8 +76,9 @@ def process():
         lookup2 = build_lookup(ws2)
         lookup3 = build_lookup(ws3)
 
+        # Détection du début des données dans le bon de commande
         data_start = 11
-        for i, row in enumerate(ws1.iter_rows(min_row=1, max_row=20), start=1):
+        for i, row in enumerate(ws1.iter_rows(min_row=1, max_row=25), start=1):
             if row[0].value and 'REFERENCE' in str(row[0].value).upper():
                 data_start = i + 1
                 break
@@ -77,8 +87,8 @@ def process():
         red_refs = []
 
         for row in ws1.iter_rows(min_row=data_start):
-            cell_a = row[0]
-            cell_b = row[1]
+            cell_a = row[0] # Référence
+            cell_b = row[1] # Quantité
             if cell_a.value is None:
                 continue
 
@@ -103,13 +113,16 @@ def process():
             qty = cell_b.value if cell_b.value not in (None, '', 0) else 1
             found = False
 
+            # Recherche Optique
             for candidate in optic_candidates(style, month):
                 if candidate.upper() in lookup2:
+                    # On modifie la cellule directement dans l'objet chargé
                     lookup2[candidate.upper()].value = qty
                     found_optic += 1
                     found = True
                     break
 
+            # Recherche Solaire
             if not found:
                 for candidate in sun_candidates(style, month):
                     if candidate.upper() in lookup3:
@@ -124,37 +137,29 @@ def process():
                 not_found += 1
                 for cell in row:
                     cell.fill = RED_FILL
-                    cell.font = Font(
-                        color="CC0000",
-                        bold=cell.font.bold if cell.font else False,
-                        size=cell.font.size if cell.font else None,
-                        name=cell.font.name if cell.font else None
-                    )
+                    if cell.font:
+                        cell.font = Font(color="CC0000", bold=cell.font.bold, size=cell.font.size, name=cell.font.name)
+                    else:
+                        cell.font = RED_FONT
                 row[2].value = '⚠ INTROUVABLE'
                 row[2].font = RED_FONT
 
+        # Onglet d'erreurs
         if not_found > 0:
-            if '⚠ Refs introuvables' in wb1.sheetnames:
-                del wb1['⚠ Refs introuvables']
-            ws_err = wb1.create_sheet('⚠ Refs introuvables')
-            ws_err.column_dimensions['A'].width = 18
-            ws_err.column_dimensions['B'].width = 40
-            ws_err['A1'] = 'Référence'
-            ws_err['B1'] = 'Statut'
-            ws_err['A1'].font = HEADER_FONT
-            ws_err['B1'].font = HEADER_FONT
+            sheet_err_name = '⚠ Refs introuvables'
+            if sheet_err_name in wb1.sheetnames:
+                del wb1[sheet_err_name]
+            ws_err = wb1.create_sheet(sheet_err_name)
+            ws_err['A1'] = 'Référence'; ws_err['B1'] = 'Statut'
+            ws_err['A1'].font = HEADER_FONT; ws_err['B1'].font = HEADER_FONT
             for i, ref in enumerate(red_refs, start=2):
                 ws_err[f'A{i}'] = ref
-                ws_err[f'A{i}'].font = Font(color="CC0000", bold=True)
-                ws_err[f'B{i}'] = '⚠ Introuvable dans les deux catalogues'
-                ws_err[f'B{i}'].font = Font(color="CC0000")
+                ws_err[f'B{i}'] = 'Absent des catalogues'
 
-        buf1 = io.BytesIO()
-        buf2 = io.BytesIO()
-        buf3 = io.BytesIO()
-        wb1.save(buf1); buf1.seek(0)
-        wb2.save(buf2); buf2.seek(0)
-        wb3.save(buf3); buf3.seek(0)
+        # Sauvegarde dans les buffers mémoire
+        buf1 = io.BytesIO(); wb1.save(buf1); buf1.seek(0)
+        buf2 = io.BytesIO(); wb2.save(buf2); buf2.seek(0)
+        buf3 = io.BytesIO(); wb3.save(buf3); buf3.seek(0)
 
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -179,8 +184,7 @@ def process():
         return response
 
     except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
