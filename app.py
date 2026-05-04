@@ -2,55 +2,62 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import openpyxl
 from openpyxl.styles import PatternFill, Font
-import io, zipfile, os, re, json, base64
+import io, zipfile, os, re, base64
 from datetime import datetime, timedelta
-from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Found-Optic','X-Found-Sun','X-Not-Found','X-Red-Refs'])
 
-# ── Storage ────────────────────────────────────────────────────────────────
-CATALOGUE_OPTIC = None   # list of item dicts
+CATALOGUE_OPTIC = None
 CATALOGUE_SUN = None
-OPTIC_BYTES = None       # raw xlsx bytes for patching
+OPTIC_BYTES = None
 SUN_BYTES = None
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'alysun2024')
 
-# ── Helpers ────────────────────────────────────────────────────────────────
 def serial_to_year_month(serial):
     epoch = datetime(1899, 12, 30)
     d = epoch + timedelta(days=int(serial))
     return d.year, d.month
 
 def extract_image_row_mapping(z):
-    try:
-        drawing_xml = z.read('xl/drawings/drawing1.xml').decode('utf-8')
-        rels_xml = z.read('xl/drawings/_rels/drawing1.xml.rels').decode('utf-8')
-        rel_map = {}
-        for m in re.finditer(r'Id="([^"]+)"[^>]+Target="([^"]+)"', rels_xml):
-            rel_map[m.group(1)] = m.group(2).replace('../', 'xl/')
-        anchors = re.findall(
-            r'<xdr:oneCellAnchor>.*?<xdr:row>(\d+)</xdr:row>.*?r:embed="([^"]+)".*?</xdr:oneCellAnchor>',
-            drawing_xml, re.DOTALL
-        )
-        row_to_img = {}
-        for row_str, rid in anchors:
-            row_to_img[int(row_str) + 1] = rel_map.get(rid, '')
-        return row_to_img
-    except:
-        return {}
+    """Extract all images from all drawing files"""
+    row_to_img = {}
+    drawing_files = sorted([f for f in z.namelist() if re.match(r'xl/drawings/drawing\d+\.xml$', f)])
+    for drawing_file in drawing_files:
+        try:
+            rels_path = drawing_file.replace('xl/drawings/', 'xl/drawings/_rels/') + '.rels'
+            drawing_xml = z.read(drawing_file).decode('utf-8')
+            rels_xml = z.read(rels_path).decode('utf-8')
+            rel_map = {}
+            for m in re.finditer(r'Id="([^"]+)"[^>]+Target="([^"]+)"', rels_xml):
+                rel_map[m.group(1)] = m.group(2).replace('../', 'xl/')
+            anchors = re.findall(
+                r'<xdr:oneCellAnchor>.*?<xdr:row>(\d+)</xdr:row>.*?r:embed="([^"]+)".*?</xdr:oneCellAnchor>',
+                drawing_xml, re.DOTALL
+            )
+            for row_str, rid in anchors:
+                row = int(row_str) + 1
+                if row not in row_to_img:
+                    row_to_img[row] = rel_map.get(rid, '')
+        except: pass
+    return row_to_img
 
 def build_catalogue(xlsx_bytes):
+    """Build catalogue — Col F = Name, Col T = Qty"""
     items = []
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
         row_to_img = extract_image_row_mapping(z)
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
         ws = wb['NuORDER Order Data'] if 'NuORDER Order Data' in wb.sheetnames else wb.active
         for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            name = row[4]
-            if not name: continue
-            style_m = re.search(r'CL(\d+)', str(name))
+            name = row[5]  # Col F
+            if not name or str(name).strip() in ('', 'Name'): continue
+            name = str(name).strip()
+            # Normalize double spaces in name
+            name = re.sub(r'\s+', ' ', name)
+            style_m = re.search(r'CL(\d+)', name)
             style = style_m.group(1) if style_m else ''
+            wholesale = row[4]  # Col E
             img_b64 = ''
             img_file = row_to_img.get(i, '')
             if img_file:
@@ -58,22 +65,18 @@ def build_catalogue(xlsx_bytes):
                     img_b64 = base64.b64encode(z.read(img_file)).decode('utf-8')
                 except: pass
             items.append({
-                'name': str(name).strip(),
+                'name': name,
                 'style': style,
                 'row': i,
                 'img': img_b64,
-                'wholesale': row[3],
-                'category': str(row[9] or ''),
+                'wholesale': wholesale,
+                'category': str(row[15] or '') if len(row) > 15 else '',  # Col P
             })
     return items
 
-def build_lookup(catalogue):
-    return {item['name'].upper(): item['row'] for item in catalogue}
-
 def patch_xlsx_quantities(xlsx_bytes, row_updates):
-    """row_updates = {row_number: qty} — patches col N directly in XML"""
-    # Build coord map: row_num → N{row_num}
-    updates = {f"N{row}": qty for row, qty in row_updates.items()}
+    """Patch col T (Qty 1) directly in XML — preserves ALL images"""
+    updates = {f"T{row}": qty for row, qty in row_updates.items()}
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zin:
         sheet_files = sorted([f for f in zin.namelist() if re.match(r'xl/worksheets/sheet\d+\.xml$', f)])
@@ -101,7 +104,6 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates):
                 zout.writestr(item, data)
     return output.getvalue()
 
-# ── Routes ─────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -114,35 +116,29 @@ def health():
 
 @app.route('/admin/upload', methods=['POST'])
 def admin_upload():
-    """Upload new catalogues — protected by password"""
     global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
     pwd = request.form.get('password', '')
     if pwd != ADMIN_PASSWORD:
         return jsonify({"error": "Mot de passe incorrect"}), 401
-
     updated = []
     if 'optique' in request.files:
         OPTIC_BYTES = request.files['optique'].read()
         CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
         updated.append(f"Optique: {len(CATALOGUE_OPTIC)} refs")
-
     if 'solaire' in request.files:
         SUN_BYTES = request.files['solaire'].read()
         CATALOGUE_SUN = build_catalogue(SUN_BYTES)
         updated.append(f"Solaire: {len(CATALOGUE_SUN)} refs")
-
     return jsonify({"success": True, "updated": updated})
 
 @app.route('/catalogue', methods=['GET'])
 def get_catalogue():
-    """Return catalogue without images (for search index)"""
     optic = [{'name': i['name'], 'style': i['style'], 'row': i['row'], 'wholesale': i['wholesale'], 'category': i['category']} for i in (CATALOGUE_OPTIC or [])]
     sun   = [{'name': i['name'], 'style': i['style'], 'row': i['row'], 'wholesale': i['wholesale'], 'category': i['category']} for i in (CATALOGUE_SUN or [])]
     return jsonify({"optic": optic, "sun": sun})
 
 @app.route('/image/<source>/<int:row>', methods=['GET'])
 def get_image(source, row):
-    """Return base64 image for a specific row"""
     cat = CATALOGUE_OPTIC if source == 'optic' else CATALOGUE_SUN
     if not cat:
         return jsonify({"error": "Catalogue non chargé"}), 404
@@ -153,20 +149,15 @@ def get_image(source, row):
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    """Generate filled Excel files from order"""
     global OPTIC_BYTES, SUN_BYTES, CATALOGUE_OPTIC, CATALOGUE_SUN
     if not OPTIC_BYTES or not SUN_BYTES:
         return jsonify({"error": "Catalogues non chargés"}), 400
-
     data = request.json
-    order = data.get('order', [])  # [{name, qty, source}]
-
+    order = data.get('order', [])
     updates_optic = {}
     updates_sun = {}
-
     lookup_optic = {i['name'].upper(): i['row'] for i in (CATALOGUE_OPTIC or [])}
     lookup_sun   = {i['name'].upper(): i['row'] for i in (CATALOGUE_SUN or [])}
-
     for item in order:
         name = item['name'].upper()
         qty = item['qty']
@@ -174,16 +165,13 @@ def generate():
             updates_optic[lookup_optic[name]] = qty
         elif item['source'] == 'sun' and name in lookup_sun:
             updates_sun[lookup_sun[name]] = qty
-
     patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic)
     patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun)
-
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('commande_optique.xlsx', patched_optic)
         zf.writestr('commande_solaire.xlsx', patched_sun)
     zip_buf.seek(0)
-
     response = send_file(zip_buf, mimetype='application/zip',
                          as_attachment=True, download_name='commande_CL.zip')
     response.headers['X-Optic-Count'] = str(len(updates_optic))
@@ -192,14 +180,12 @@ def generate():
 
 @app.route('/process', methods=['POST'])
 def process():
-    """Legacy: fill catalogues from a commande file"""
     try:
         f1 = request.files.get('commande')
         f2 = request.files.get('optique')
         f3 = request.files.get('solaire')
         if not f1 or not f2 or not f3:
             return jsonify({"error": "3 fichiers requis"}), 400
-
         bytes1 = f1.read(); bytes2 = f2.read(); bytes3 = f3.read()
         wb1 = openpyxl.load_workbook(io.BytesIO(bytes1), keep_vba=False)
         ws1 = wb1.active
@@ -208,7 +194,9 @@ def process():
         lookup2 = {i['name'].upper(): i['row'] for i in cat2}
         lookup3 = {i['name'].upper(): i['row'] for i in cat3}
 
-        def optic_cands(s, m): return [f"CL{s} OPT {str(m).zfill(2)}"]
+        def optic_cands(s, m):
+            c = str(m).zfill(2)
+            return [f"CL{s} OPT {c}", f"CL{s} OPT  {c}"]
         def sun_cands(s, m):
             c = str(m).zfill(2)
             return [f"CL{s} SG OPT {c}", f"CL{s} SG {c}", f"CL{s} SG Z OPT {c}"]
