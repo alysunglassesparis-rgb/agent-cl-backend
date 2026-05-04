@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Found-Optic','X-Found-Sun','X-Not-Found','X-Red-Refs'])
 
-# ── Persistent storage paths ───────────────────────────────────────────────
 DATA_DIR = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/tmp/cl_data')
 os.makedirs(DATA_DIR, exist_ok=True)
 OPTIC_PATH = os.path.join(DATA_DIR, 'optic.xlsx')
@@ -19,6 +18,70 @@ CATALOGUE_SUN   = None
 OPTIC_BYTES     = None
 SUN_BYTES       = None
 ADMIN_PASSWORD  = os.environ.get('ADMIN_PASSWORD', 'alysun2024')
+
+# ── Smart column detector ──────────────────────────────────────────────────
+NAME_KEYWORDS    = ['name', 'nom', 'reference', 'ref', 'style name', 'product name']
+QTY_KEYWORDS     = ['qty 1', 'qty1', 'qty', 'quantity', 'quantite', 'quantité', 'units']
+PRICE_KEYWORDS   = ['wholesale', 'prix', 'price', 'wholesale (eur)', 'unit price', 'msrp']
+STYLE_KEYWORDS   = ['style number', 'style no', 'style', 'numero', 'number']
+
+def normalize(s):
+    """Normalize spaces and case"""
+    return re.sub(r'\s+', ' ', str(s).strip()).lower()
+
+def detect_columns(ws):
+    """Auto-detect column indices by header keywords"""
+    cols = {'name': None, 'qty': None, 'wholesale': None, 'style': None}
+    
+    # Scan header row
+    header_row = None
+    for r in range(1, 5):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, 30)]
+        if any(v and any(k in normalize(str(v)) for k in ['name','qty','wholesale','season']) for v in row_vals):
+            header_row = r
+            break
+    
+    if not header_row:
+        return cols, 2
+    
+    for c in range(1, 30):
+        val = ws.cell(row=header_row, column=c).value
+        if not val: continue
+        v = normalize(str(val))
+        
+        # Name column — exact match first, then partial
+        if cols['name'] is None:
+            if any(v == k for k in NAME_KEYWORDS) or v == 'name':
+                cols['name'] = c
+        
+        # Qty column — prefer "qty 1" over "qty"
+        if cols['qty'] is None:
+            if v in ('qty 1', 'qty1', 'quantity 1'):
+                cols['qty'] = c
+            elif v in ('qty', 'quantity', 'quantité') and cols['qty'] is None:
+                cols['qty'] = c
+        
+        # Wholesale
+        if cols['wholesale'] is None:
+            if any(k in v for k in PRICE_KEYWORDS):
+                if 'total' not in v and 'msrp' not in v and 'size price' not in v:
+                    cols['wholesale'] = c
+        
+        # Style number
+        if cols['style'] is None:
+            if any(v == k for k in STYLE_KEYWORDS):
+                cols['style'] = c
+    
+    # Fallback: detect name column by content (looks like "CL4390 OPT 04")
+    if cols['name'] is None:
+        for c in range(1, 30):
+            cell = ws.cell(row=header_row + 1, column=c)
+            if cell.value and re.match(r'^CL\d+', str(cell.value)):
+                cols['name'] = c
+                break
+    
+    data_start = header_row + 1
+    return cols, data_start
 
 def serial_to_year_month(serial):
     epoch = datetime(1899, 12, 30)
@@ -53,51 +116,51 @@ def build_catalogue(xlsx_bytes):
         row_to_img = extract_image_row_mapping(z)
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
         ws = wb['NuORDER Order Data'] if 'NuORDER Order Data' in wb.sheetnames else wb.active
-        for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            name = row[5]  # Col F
-            if not name or str(name).strip() in ('', 'Name'): continue
-            name = re.sub(r'\s+', ' ', str(name).strip())
+        
+        cols, data_start = detect_columns(ws)
+        name_col = cols['name']
+        qty_col  = cols['qty']
+        price_col = cols['wholesale']
+        
+        print(f"Detected cols — name:{name_col} qty:{qty_col} price:{price_col} start:{data_start}")
+        
+        if not name_col:
+            print("ERROR: could not detect name column!")
+            return items
+        
+        for i, row in enumerate(ws.iter_rows(min_row=data_start, values_only=True), start=data_start):
+            raw_name = row[name_col - 1] if name_col else None
+            if not raw_name or str(raw_name).strip() in ('', 'Name'): continue
+            
+            # Normalize name — collapse multiple spaces
+            name = re.sub(r'\s+', ' ', str(raw_name).strip())
+            
             style_m = re.search(r'CL(\d+)', name)
             style = style_m.group(1) if style_m else ''
-            wholesale = row[4]  # Col E
+            wholesale = row[price_col - 1] if price_col else None
+            
             img_b64 = ''
             img_file = row_to_img.get(i, '')
             if img_file:
                 try:
                     img_b64 = base64.b64encode(z.read(img_file)).decode('utf-8')
                 except: pass
+            
             items.append({
                 'name': name,
                 'style': style,
                 'row': i,
                 'img': img_b64,
                 'wholesale': wholesale,
-                'category': str(row[15] or '') if len(row) > 15 else '',
+                'qty_col': qty_col,  # Store for patching
+                'category': '',
             })
+    
     return items
 
-def load_from_disk():
-    """Load catalogues from disk on startup"""
-    global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
-    if os.path.exists(OPTIC_PATH):
-        try:
-            with open(OPTIC_PATH, 'rb') as f:
-                OPTIC_BYTES = f.read()
-            CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
-            print(f"Loaded optic from disk: {len(CATALOGUE_OPTIC)} refs")
-        except Exception as e:
-            print(f"Error loading optic: {e}")
-    if os.path.exists(SUN_PATH):
-        try:
-            with open(SUN_PATH, 'rb') as f:
-                SUN_BYTES = f.read()
-            CATALOGUE_SUN = build_catalogue(SUN_BYTES)
-            print(f"Loaded sun from disk: {len(CATALOGUE_SUN)} refs")
-        except Exception as e:
-            print(f"Error loading sun: {e}")
-
-def patch_xlsx_quantities(xlsx_bytes, row_updates):
-    updates = {f"T{row}": qty for row, qty in row_updates.items()}
+def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='T'):
+    """Patch qty cells directly in XML — preserves ALL images"""
+    updates = {f"{qty_col_letter}{row}": qty for row, qty in row_updates.items()}
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zin:
         sheet_files = sorted([f for f in zin.namelist() if re.match(r'xl/worksheets/sheet\d+\.xml$', f)])
@@ -125,10 +188,37 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates):
                 zout.writestr(item, data)
     return output.getvalue()
 
-# ── Load on startup ────────────────────────────────────────────────────────
+def get_qty_col_letter(catalogue):
+    """Get the qty column letter from catalogue"""
+    if catalogue:
+        for item in catalogue:
+            if item.get('qty_col'):
+                # Convert column index to letter
+                col = item['qty_col']
+                result = ''
+                while col:
+                    col, rem = divmod(col - 1, 26)
+                    result = chr(65 + rem) + result
+                return result
+    return 'T'  # fallback
+
+def load_from_disk():
+    global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
+    if os.path.exists(OPTIC_PATH):
+        try:
+            with open(OPTIC_PATH, 'rb') as f: OPTIC_BYTES = f.read()
+            CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
+            print(f"Loaded optic: {len(CATALOGUE_OPTIC)} refs")
+        except Exception as e: print(f"Error loading optic: {e}")
+    if os.path.exists(SUN_PATH):
+        try:
+            with open(SUN_PATH, 'rb') as f: SUN_BYTES = f.read()
+            CATALOGUE_SUN = build_catalogue(SUN_BYTES)
+            print(f"Loaded sun: {len(CATALOGUE_SUN)} refs")
+        except Exception as e: print(f"Error loading sun: {e}")
+
 load_from_disk()
 
-# ── Routes ─────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -137,7 +227,6 @@ def health():
         "sun_loaded": CATALOGUE_SUN is not None,
         "optic_count": len(CATALOGUE_OPTIC) if CATALOGUE_OPTIC else 0,
         "sun_count": len(CATALOGUE_SUN) if CATALOGUE_SUN else 0,
-        "data_dir": DATA_DIR,
         "optic_on_disk": os.path.exists(OPTIC_PATH),
         "sun_on_disk": os.path.exists(SUN_PATH),
     })
@@ -151,15 +240,12 @@ def admin_upload():
     updated = []
     if 'optique' in request.files:
         OPTIC_BYTES = request.files['optique'].read()
-        # Save to disk for persistence
-        with open(OPTIC_PATH, 'wb') as f:
-            f.write(OPTIC_BYTES)
+        with open(OPTIC_PATH, 'wb') as f: f.write(OPTIC_BYTES)
         CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
         updated.append(f"Optique: {len(CATALOGUE_OPTIC)} refs")
     if 'solaire' in request.files:
         SUN_BYTES = request.files['solaire'].read()
-        with open(SUN_PATH, 'wb') as f:
-            f.write(SUN_BYTES)
+        with open(SUN_PATH, 'wb') as f: f.write(SUN_BYTES)
         CATALOGUE_SUN = build_catalogue(SUN_BYTES)
         updated.append(f"Solaire: {len(CATALOGUE_SUN)} refs")
     return jsonify({"success": True, "updated": updated})
@@ -189,17 +275,23 @@ def generate():
     order = data.get('order', [])
     updates_optic = {}
     updates_sun = {}
-    lookup_optic = {i['name'].upper(): i['row'] for i in (CATALOGUE_OPTIC or [])}
-    lookup_sun   = {i['name'].upper(): i['row'] for i in (CATALOGUE_SUN or [])}
+    # Normalize lookup keys
+    lookup_optic = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_OPTIC or [])}
+    lookup_sun   = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_SUN or [])}
     for item in order:
-        name = item['name'].upper()
+        name = re.sub(r'\s+', ' ', item['name']).upper()
         qty = item['qty']
         if item['source'] == 'optic' and name in lookup_optic:
             updates_optic[lookup_optic[name]] = qty
         elif item['source'] == 'sun' and name in lookup_sun:
             updates_sun[lookup_sun[name]] = qty
-    patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic)
-    patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun)
+
+    qty_col_optic = get_qty_col_letter(CATALOGUE_OPTIC)
+    qty_col_sun   = get_qty_col_letter(CATALOGUE_SUN)
+
+    patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic, qty_col_optic)
+    patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun, qty_col_sun)
+
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('commande_optique.xlsx', patched_optic)
@@ -224,12 +316,13 @@ def process():
         ws1 = wb1.active
         cat2 = build_catalogue(bytes2)
         cat3 = build_catalogue(bytes3)
-        lookup2 = {i['name'].upper(): i['row'] for i in cat2}
-        lookup3 = {i['name'].upper(): i['row'] for i in cat3}
+        # Normalize lookups
+        lookup2 = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in cat2}
+        lookup3 = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in cat3}
 
         def optic_cands(s, m):
             c = str(m).zfill(2)
-            return [f"CL{s} OPT {c}", f"CL{s} OPT  {c}"]
+            return [f"CL{s} OPT {c}"]
         def sun_cands(s, m):
             c = str(m).zfill(2)
             return [f"CL{s} SG OPT {c}", f"CL{s} SG {c}", f"CL{s} SG Z OPT {c}"]
@@ -281,11 +374,13 @@ def process():
                 ws_err[f'B{i}'] = '⚠ Introuvable'; ws_err[f'B{i}'].font = Font(color="CC0000")
 
         buf1 = io.BytesIO(); wb1.save(buf1); buf1.seek(0)
+        qty2 = get_qty_col_letter(cat2)
+        qty3 = get_qty_col_letter(cat3)
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(f1.filename.replace('.xlsx','') + '_traite.xlsx', buf1.read())
-            zf.writestr(f2.filename.replace('.xlsx','') + '_MAJ.xlsx', patch_xlsx_quantities(bytes2, updates2))
-            zf.writestr(f3.filename.replace('.xlsx','') + '_MAJ.xlsx', patch_xlsx_quantities(bytes3, updates3))
+            zf.writestr(f2.filename.replace('.xlsx','') + '_MAJ.xlsx', patch_xlsx_quantities(bytes2, updates2, qty2))
+            zf.writestr(f3.filename.replace('.xlsx','') + '_MAJ.xlsx', patch_xlsx_quantities(bytes3, updates3, qty3))
         zip_buf.seek(0)
         response = send_file(zip_buf, mimetype='application/zip', as_attachment=True, download_name='commande_traitee.zip')
         response.headers['X-Found-Optic'] = str(found_optic)
