@@ -8,11 +8,17 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Found-Optic','X-Found-Sun','X-Not-Found','X-Red-Refs'])
 
+# ── Persistent storage paths ───────────────────────────────────────────────
+DATA_DIR = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/tmp/cl_data')
+os.makedirs(DATA_DIR, exist_ok=True)
+OPTIC_PATH = os.path.join(DATA_DIR, 'optic.xlsx')
+SUN_PATH   = os.path.join(DATA_DIR, 'sun.xlsx')
+
 CATALOGUE_OPTIC = None
-CATALOGUE_SUN = None
-OPTIC_BYTES = None
-SUN_BYTES = None
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'alysun2024')
+CATALOGUE_SUN   = None
+OPTIC_BYTES     = None
+SUN_BYTES       = None
+ADMIN_PASSWORD  = os.environ.get('ADMIN_PASSWORD', 'alysun2024')
 
 def serial_to_year_month(serial):
     epoch = datetime(1899, 12, 30)
@@ -20,7 +26,6 @@ def serial_to_year_month(serial):
     return d.year, d.month
 
 def extract_image_row_mapping(z):
-    """Extract all images from all drawing files"""
     row_to_img = {}
     drawing_files = sorted([f for f in z.namelist() if re.match(r'xl/drawings/drawing\d+\.xml$', f)])
     for drawing_file in drawing_files:
@@ -43,7 +48,6 @@ def extract_image_row_mapping(z):
     return row_to_img
 
 def build_catalogue(xlsx_bytes):
-    """Build catalogue — Col F = Name, Col T = Qty"""
     items = []
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
         row_to_img = extract_image_row_mapping(z)
@@ -52,9 +56,7 @@ def build_catalogue(xlsx_bytes):
         for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
             name = row[5]  # Col F
             if not name or str(name).strip() in ('', 'Name'): continue
-            name = str(name).strip()
-            # Normalize double spaces in name
-            name = re.sub(r'\s+', ' ', name)
+            name = re.sub(r'\s+', ' ', str(name).strip())
             style_m = re.search(r'CL(\d+)', name)
             style = style_m.group(1) if style_m else ''
             wholesale = row[4]  # Col E
@@ -70,12 +72,31 @@ def build_catalogue(xlsx_bytes):
                 'row': i,
                 'img': img_b64,
                 'wholesale': wholesale,
-                'category': str(row[15] or '') if len(row) > 15 else '',  # Col P
+                'category': str(row[15] or '') if len(row) > 15 else '',
             })
     return items
 
+def load_from_disk():
+    """Load catalogues from disk on startup"""
+    global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
+    if os.path.exists(OPTIC_PATH):
+        try:
+            with open(OPTIC_PATH, 'rb') as f:
+                OPTIC_BYTES = f.read()
+            CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
+            print(f"Loaded optic from disk: {len(CATALOGUE_OPTIC)} refs")
+        except Exception as e:
+            print(f"Error loading optic: {e}")
+    if os.path.exists(SUN_PATH):
+        try:
+            with open(SUN_PATH, 'rb') as f:
+                SUN_BYTES = f.read()
+            CATALOGUE_SUN = build_catalogue(SUN_BYTES)
+            print(f"Loaded sun from disk: {len(CATALOGUE_SUN)} refs")
+        except Exception as e:
+            print(f"Error loading sun: {e}")
+
 def patch_xlsx_quantities(xlsx_bytes, row_updates):
-    """Patch col T (Qty 1) directly in XML — preserves ALL images"""
     updates = {f"T{row}": qty for row, qty in row_updates.items()}
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zin:
@@ -104,6 +125,10 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates):
                 zout.writestr(item, data)
     return output.getvalue()
 
+# ── Load on startup ────────────────────────────────────────────────────────
+load_from_disk()
+
+# ── Routes ─────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -112,6 +137,9 @@ def health():
         "sun_loaded": CATALOGUE_SUN is not None,
         "optic_count": len(CATALOGUE_OPTIC) if CATALOGUE_OPTIC else 0,
         "sun_count": len(CATALOGUE_SUN) if CATALOGUE_SUN else 0,
+        "data_dir": DATA_DIR,
+        "optic_on_disk": os.path.exists(OPTIC_PATH),
+        "sun_on_disk": os.path.exists(SUN_PATH),
     })
 
 @app.route('/admin/upload', methods=['POST'])
@@ -123,10 +151,15 @@ def admin_upload():
     updated = []
     if 'optique' in request.files:
         OPTIC_BYTES = request.files['optique'].read()
+        # Save to disk for persistence
+        with open(OPTIC_PATH, 'wb') as f:
+            f.write(OPTIC_BYTES)
         CATALOGUE_OPTIC = build_catalogue(OPTIC_BYTES)
         updated.append(f"Optique: {len(CATALOGUE_OPTIC)} refs")
     if 'solaire' in request.files:
         SUN_BYTES = request.files['solaire'].read()
+        with open(SUN_PATH, 'wb') as f:
+            f.write(SUN_BYTES)
         CATALOGUE_SUN = build_catalogue(SUN_BYTES)
         updated.append(f"Solaire: {len(CATALOGUE_SUN)} refs")
     return jsonify({"success": True, "updated": updated})
