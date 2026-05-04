@@ -19,69 +19,45 @@ OPTIC_BYTES     = None
 SUN_BYTES       = None
 ADMIN_PASSWORD  = os.environ.get('ADMIN_PASSWORD', 'alysun2024')
 
-# ── Smart column detector ──────────────────────────────────────────────────
-NAME_KEYWORDS    = ['name', 'nom', 'reference', 'ref', 'style name', 'product name']
-QTY_KEYWORDS     = ['qty 1', 'qty1', 'qty', 'quantity', 'quantite', 'quantité', 'units']
-PRICE_KEYWORDS   = ['wholesale', 'prix', 'price', 'wholesale (eur)', 'unit price', 'msrp']
-STYLE_KEYWORDS   = ['style number', 'style no', 'style', 'numero', 'number']
+NAME_KEYWORDS  = ['name', 'nom', 'reference', 'ref', 'style name']
+QTY_KEYWORDS   = ['qty 1', 'qty1', 'quantity 1', 'qty', 'quantity']
+PRICE_KEYWORDS = ['wholesale', 'prix', 'price', 'wholesale (eur)']
 
 def normalize(s):
-    """Normalize spaces and case"""
     return re.sub(r'\s+', ' ', str(s).strip()).lower()
 
 def detect_columns(ws):
-    """Auto-detect column indices by header keywords"""
-    cols = {'name': None, 'qty': None, 'wholesale': None, 'style': None}
-    
-    # Scan header row
+    cols = {'name': None, 'qty': None, 'wholesale': None}
     header_row = None
     for r in range(1, 5):
         row_vals = [ws.cell(row=r, column=c).value for c in range(1, 30)]
         if any(v and any(k in normalize(str(v)) for k in ['name','qty','wholesale','season']) for v in row_vals):
             header_row = r
             break
-    
     if not header_row:
         return cols, 2
-    
     for c in range(1, 30):
         val = ws.cell(row=header_row, column=c).value
         if not val: continue
         v = normalize(str(val))
-        
-        # Name column — exact match first, then partial
-        if cols['name'] is None:
-            if any(v == k for k in NAME_KEYWORDS) or v == 'name':
-                cols['name'] = c
-        
-        # Qty column — prefer "qty 1" over "qty"
+        if cols['name'] is None and v == 'name':
+            cols['name'] = c
         if cols['qty'] is None:
             if v in ('qty 1', 'qty1', 'quantity 1'):
                 cols['qty'] = c
-            elif v in ('qty', 'quantity', 'quantité') and cols['qty'] is None:
+            elif v in ('qty', 'quantity') and cols['qty'] is None:
                 cols['qty'] = c
-        
-        # Wholesale
         if cols['wholesale'] is None:
             if any(k in v for k in PRICE_KEYWORDS):
                 if 'total' not in v and 'msrp' not in v and 'size price' not in v:
                     cols['wholesale'] = c
-        
-        # Style number
-        if cols['style'] is None:
-            if any(v == k for k in STYLE_KEYWORDS):
-                cols['style'] = c
-    
-    # Fallback: detect name column by content (looks like "CL4390 OPT 04")
     if cols['name'] is None:
         for c in range(1, 30):
             cell = ws.cell(row=header_row + 1, column=c)
             if cell.value and re.match(r'^CL\d+', str(cell.value)):
                 cols['name'] = c
                 break
-    
-    data_start = header_row + 1
-    return cols, data_start
+    return cols, header_row + 1
 
 def serial_to_year_month(serial):
     epoch = datetime(1899, 12, 30)
@@ -101,8 +77,7 @@ def extract_image_row_mapping(z):
                 rel_map[m.group(1)] = m.group(2).replace('../', 'xl/')
             anchors = re.findall(
                 r'<xdr:oneCellAnchor>.*?<xdr:row>(\d+)</xdr:row>.*?r:embed="([^"]+)".*?</xdr:oneCellAnchor>',
-                drawing_xml, re.DOTALL
-            )
+                drawing_xml, re.DOTALL)
             for row_str, rid in anchors:
                 row = int(row_str) + 1
                 if row not in row_to_img:
@@ -116,50 +91,47 @@ def build_catalogue(xlsx_bytes):
         row_to_img = extract_image_row_mapping(z)
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
         ws = wb['NuORDER Order Data'] if 'NuORDER Order Data' in wb.sheetnames else wb.active
-        
         cols, data_start = detect_columns(ws)
-        name_col = cols['name']
-        qty_col  = cols['qty']
+        name_col  = cols['name']
+        qty_col   = cols['qty']
         price_col = cols['wholesale']
-        
         print(f"Detected cols — name:{name_col} qty:{qty_col} price:{price_col} start:{data_start}")
-        
         if not name_col:
             print("ERROR: could not detect name column!")
             return items
-        
         for i, row in enumerate(ws.iter_rows(min_row=data_start, values_only=True), start=data_start):
             raw_name = row[name_col - 1] if name_col else None
             if not raw_name or str(raw_name).strip() in ('', 'Name'): continue
-            
-            # Normalize name — collapse multiple spaces
             name = re.sub(r'\s+', ' ', str(raw_name).strip())
-            
             style_m = re.search(r'CL(\d+)', name)
             style = style_m.group(1) if style_m else ''
             wholesale = row[price_col - 1] if price_col else None
-            
             img_b64 = ''
             img_file = row_to_img.get(i, '')
             if img_file:
                 try:
                     img_b64 = base64.b64encode(z.read(img_file)).decode('utf-8')
                 except: pass
-            
             items.append({
-                'name': name,
-                'style': style,
-                'row': i,
-                'img': img_b64,
-                'wholesale': wholesale,
-                'qty_col': qty_col,  # Store for patching
-                'category': '',
+                'name': name, 'style': style, 'row': i,
+                'img': img_b64, 'wholesale': wholesale,
+                'qty_col': qty_col, 'category': '',
             })
-    
     return items
 
+def get_qty_col_letter(catalogue):
+    if catalogue:
+        for item in catalogue:
+            if item.get('qty_col'):
+                col = item['qty_col']
+                result = ''
+                while col:
+                    col, rem = divmod(col - 1, 26)
+                    result = chr(65 + rem) + result
+                return result
+    return 'T'
+
 def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='T'):
-    """Patch qty cells directly in XML — preserves ALL images"""
     updates = {f"{qty_col_letter}{row}": qty for row, qty in row_updates.items()}
     output = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zin:
@@ -185,29 +157,14 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='T'):
                                 return f'{m.group(1)}{m.group(2)}<c r="{c}"><v>{q}</v></c>{m.group(3)}'
                             xml = re.sub(rp, ins, xml, flags=re.DOTALL)
                     data = xml.encode('utf-8')
-                # Force full recalculation on open
                 if item == 'xl/workbook.xml':
                     wbxml = data.decode('utf-8')
-                    wbxml = __import__('re').sub(r'<calcPr[^/]*/>', '<calcPr fullCalcOnLoad="1"/>', wbxml)
+                    wbxml = re.sub(r'<calcPr[^/]*/>', '<calcPr fullCalcOnLoad="1"/>', wbxml)
                     if '<calcPr' not in wbxml:
                         wbxml = wbxml.replace('</workbook>', '<calcPr fullCalcOnLoad="1"/></workbook>')
                     data = wbxml.encode('utf-8')
                 zout.writestr(item, data)
     return output.getvalue()
-
-def get_qty_col_letter(catalogue):
-    """Get the qty column letter from catalogue"""
-    if catalogue:
-        for item in catalogue:
-            if item.get('qty_col'):
-                # Convert column index to letter
-                col = item['qty_col']
-                result = ''
-                while col:
-                    col, rem = divmod(col - 1, 26)
-                    result = chr(65 + rem) + result
-                return result
-    return 'T'  # fallback
 
 def load_from_disk():
     global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
@@ -266,8 +223,7 @@ def get_catalogue():
 @app.route('/image/<source>/<int:row>', methods=['GET'])
 def get_image(source, row):
     cat = CATALOGUE_OPTIC if source == 'optic' else CATALOGUE_SUN
-    if not cat:
-        return jsonify({"error": "Catalogue non chargé"}), 404
+    if not cat: return jsonify({"error": "Catalogue non chargé"}), 404
     for item in cat:
         if item['row'] == row:
             return jsonify({"img": item['img'], "name": item['name']})
@@ -282,7 +238,6 @@ def generate():
     order = data.get('order', [])
     updates_optic = {}
     updates_sun = {}
-    # Normalize lookup keys
     lookup_optic = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_OPTIC or [])}
     lookup_sun   = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_SUN or [])}
     for item in order:
@@ -292,13 +247,10 @@ def generate():
             updates_optic[lookup_optic[name]] = qty
         elif item['source'] == 'sun' and name in lookup_sun:
             updates_sun[lookup_sun[name]] = qty
-
     qty_col_optic = get_qty_col_letter(CATALOGUE_OPTIC)
     qty_col_sun   = get_qty_col_letter(CATALOGUE_SUN)
-
     patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic, qty_col_optic)
     patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun, qty_col_sun)
-
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('commande_optique.xlsx', patched_optic)
@@ -323,28 +275,23 @@ def process():
         ws1 = wb1.active
         cat2 = build_catalogue(bytes2)
         cat3 = build_catalogue(bytes3)
-        # Normalize lookups
         lookup2 = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in cat2}
         lookup3 = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in cat3}
-
         def optic_cands(s, m):
             c = str(m).zfill(2)
-            return [f"CL{s} OPT {c}"]
+            return [f"CL{s} OPT {c}", f"CL{s} OPT  {c}"]
         def sun_cands(s, m):
             c = str(m).zfill(2)
             return [f"CL{s} SG OPT {c}", f"CL{s} SG {c}", f"CL{s} SG Z OPT {c}"]
-
         data_start = 11
         for i, row in enumerate(ws1.iter_rows(min_row=1, max_row=20), start=1):
             if row[0].value and 'REFERENCE' in str(row[0].value).upper():
                 data_start = i + 1; break
-
         RED_FILL = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
         RED_FONT = Font(color="CC0000", bold=True)
         found_optic = found_sun = not_found = 0
         red_refs = []
         updates2 = {}; updates3 = {}
-
         for row in ws1.iter_rows(min_row=data_start):
             ca, cb = row[0], row[1]
             if ca.value is None: continue
@@ -370,7 +317,6 @@ def process():
                     cell.font = Font(color="CC0000", bold=cell.font.bold if cell.font else False,
                                      size=cell.font.size if cell.font else None, name=cell.font.name if cell.font else None)
                 row[2].value = '⚠ INTROUVABLE'; row[2].font = RED_FONT
-
         if not_found > 0:
             if '⚠ Refs introuvables' in wb1.sheetnames: del wb1['⚠ Refs introuvables']
             ws_err = wb1.create_sheet('⚠ Refs introuvables')
@@ -379,7 +325,6 @@ def process():
             for i, ref in enumerate(red_refs, start=2):
                 ws_err[f'A{i}'] = ref; ws_err[f'A{i}'].font = Font(color="CC0000", bold=True)
                 ws_err[f'B{i}'] = '⚠ Introuvable'; ws_err[f'B{i}'].font = Font(color="CC0000")
-
         buf1 = io.BytesIO(); wb1.save(buf1); buf1.seek(0)
         qty2 = get_qty_col_letter(cat2)
         qty3 = get_qty_col_letter(cat3)
