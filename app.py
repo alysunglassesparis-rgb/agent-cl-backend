@@ -185,6 +185,13 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='T'):
                                 return f'{m.group(1)}{m.group(2)}<c r="{c}"><v>{q}</v></c>{m.group(3)}'
                             xml = re.sub(rp, ins, xml, flags=re.DOTALL)
                     data = xml.encode('utf-8')
+                # Force full recalculation on open
+                if item == 'xl/workbook.xml':
+                    wbxml = data.decode('utf-8')
+                    wbxml = __import__('re').sub(r'<calcPr[^/]*/>', '<calcPr fullCalcOnLoad="1"/>', wbxml)
+                    if '<calcPr' not in wbxml:
+                        wbxml = wbxml.replace('</workbook>', '<calcPr fullCalcOnLoad="1"/></workbook>')
+                    data = wbxml.encode('utf-8')
                 zout.writestr(item, data)
     return output.getvalue()
 
