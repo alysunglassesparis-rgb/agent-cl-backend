@@ -414,9 +414,9 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image as RLImage
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-import base64, tempfile
+import base64
 
 GMAIL_USER = 'alysunglassesparis@gmail.com'
 GMAIL_APP_PASSWORD = 'sosb hyth ijxm mmri'
@@ -519,21 +519,7 @@ def generate_pdf(client_info, order):
                                     textColor=orange, spaceBefore=12, spaceAfter=6)
     
     # ── HEADER with logo ──
-    logo_bytes = get_logo_bytes()
-    if logo_bytes:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            tmp.write(logo_bytes)
-            tmp_path = tmp.name
-        logo = RLImage(tmp_path, width=3*cm, height=3*cm)
-        header_data = [[logo, Paragraph('BON DE VISITE', title_style)]]
-        header_table = Table(header_data, colWidths=[3.5*cm, 13.5*cm])
-        header_table.setStyle(TableStyle([
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('ALIGN', (1,0), (1,0), 'CENTER'),
-        ]))
-        story.append(header_table)
-    else:
-        story.append(Paragraph('BON DE VISITE', title_style))
+    story.append(Paragraph('BON DE VISITE', title_style))
     
     story.append(Paragraph('ALYSUN GLASSES · Carolina Lemke', sub_style))
     story.append(Paragraph(datetime.now().strftime('%d/%m/%Y à %H:%M'), sub_style))
