@@ -399,274 +399,9 @@ def process():
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-
-
-# ── PDF + TXT + EMAIL ──────────────────────────────────────────────────────
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import cm
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-import base64
-
-GMAIL_USER = 'alysunglassesparis@gmail.com'
-GMAIL_APP_PASSWORD = 'sosb hyth ijxm mmri'
-RECIPIENT_EMAIL = 'michael@alysunglasses.com'
-
-LOGO_B64_PATH = os.path.join(os.path.dirname(__file__), 'logo_b64.txt')
-
-def get_logo_bytes():
-    try:
-        with open(LOGO_B64_PATH, 'r') as f:
-            return base64.b64decode(f.read())
-    except:
-        return None
-
-def format_ref_short(name):
-    """Convert CL4390 OPT 04 → 4390-4 and CL3131 SG OPT 07 → 3131-7"""
-    name = re.sub(r'\s+', ' ', name.strip())
-    # Optique: CL4390 OPT 04
-    m = re.match(r'CL(\d+)\s+OPT\s+0?(\d+)', name)
-    if m: return f"{m.group(1)}-{int(m.group(2))}"
-    # Solaire: CL3131 SG OPT 07
-    m = re.match(r'CL(\d+)\s+SG\s+(?:OPT\s+)?0?(\d+)', name)
-    if m: return f"{m.group(1)}-{int(m.group(2))}"
-    return name
-
-def generate_txt(client_info, order):
-    """Generate plain text recap"""
-    lines = []
-    lines.append("=" * 60)
-    lines.append("         BON DE VISITE — ALYSUN GLASSES")
-    lines.append("=" * 60)
-    lines.append(f"Date : {datetime.now().strftime('%d/%m/%Y à %H:%M')}")
-    lines.append("")
-    lines.append("── INFORMATIONS CLIENT ──────────────────────────────")
-    lines.append(f"Magasin    : {client_info.get('magasin', '—')}")
-    lines.append(f"Société    : {client_info.get('societe', '—')}")
-    lines.append(f"SIRET      : {client_info.get('siret', '—')}")
-    lines.append(f"TVA        : {client_info.get('tva', '—')}")
-    lines.append(f"Adresse    : {client_info.get('adresse', '—')}")
-    lines.append(f"Email      : {client_info.get('email', '—')}")
-    if client_info.get('commentaire'):
-        lines.append("")
-        lines.append("── COMMENTAIRE ──────────────────────────────────────")
-        lines.append(client_info.get('commentaire'))
-    lines.append("")
-    lines.append("── RÉFÉRENCES COMMANDÉES ────────────────────────────")
-    
-    total_units = 0
-    optic_items = [i for i in order if i.get('source') == 'optic']
-    sun_items   = [i for i in order if i.get('source') == 'sun']
-    
-    if optic_items:
-        lines.append("\n  OPTIQUE :")
-        for item in optic_items:
-            ref_short = format_ref_short(item['name'])
-            lines.append(f"    {ref_short:<12} ({item['name']})  × {item['qty']}")
-            total_units += item['qty']
-    
-    if sun_items:
-        lines.append("\n  SOLAIRE :")
-        for item in sun_items:
-            ref_short = format_ref_short(item['name'])
-            lines.append(f"    {ref_short:<12} ({item['name']})  × {item['qty']}")
-            total_units += item['qty']
-    
-    lines.append("")
-    lines.append(f"  Total : {len(order)} références · {total_units} unités")
-    lines.append("=" * 60)
-    lines.append("   Alysun Glasses · michael@alysunglasses.com")
-    lines.append("=" * 60)
-    
-    return "\n".join(lines)
-
-def generate_pdf(client_info, order):
-    """Generate professional PDF with logo"""
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                            leftMargin=2*cm, rightMargin=2*cm,
-                            topMargin=2*cm, bottomMargin=2*cm)
-    
-    styles = getSampleStyleSheet()
-    story = []
-    
-    # Colors
-    orange = colors.HexColor('#E8750A')
-    dark = colors.HexColor('#1a1410')
-    light_gray = colors.HexColor('#f5f0e8')
-    mid_gray = colors.HexColor('#d4c9b0')
-    
-    # Custom styles
-    title_style = ParagraphStyle('title', fontSize=22, fontName='Helvetica-Bold',
-                                  textColor=dark, alignment=TA_CENTER, spaceAfter=4)
-    sub_style = ParagraphStyle('sub', fontSize=10, fontName='Helvetica',
-                                textColor=colors.HexColor('#8a7f6e'), alignment=TA_CENTER, spaceAfter=2)
-    label_style = ParagraphStyle('label', fontSize=8, fontName='Helvetica-Bold',
-                                  textColor=colors.HexColor('#8a7f6e'), spaceBefore=6)
-    value_style = ParagraphStyle('value', fontSize=11, fontName='Helvetica',
-                                  textColor=dark, spaceAfter=2)
-    section_style = ParagraphStyle('section', fontSize=10, fontName='Helvetica-Bold',
-                                    textColor=orange, spaceBefore=12, spaceAfter=6)
-    
-    # ── HEADER with logo ──
-    story.append(Paragraph('BON DE VISITE', title_style))
-    
-    story.append(Paragraph('ALYSUN GLASSES · Carolina Lemke', sub_style))
-    story.append(Paragraph(datetime.now().strftime('%d/%m/%Y à %H:%M'), sub_style))
-    story.append(Spacer(1, 0.3*cm))
-    story.append(HRFlowable(width='100%', thickness=2, color=orange))
-    story.append(Spacer(1, 0.4*cm))
-    
-    # ── CLIENT INFO ──
-    story.append(Paragraph('INFORMATIONS CLIENT', section_style))
-    
-    info_data = [
-        ['Magasin', client_info.get('magasin', '—')],
-        ['Société', client_info.get('societe', '—')],
-        ['SIRET', client_info.get('siret', '—')],
-        ['N° TVA', client_info.get('tva', '—')],
-        ['Adresse', client_info.get('adresse', '—')],
-        ['Email', client_info.get('email', '—')],
-    ]
-    
-    info_table = Table(info_data, colWidths=[4*cm, 13*cm])
-    info_table.setStyle(TableStyle([
-        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 10),
-        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#8a7f6e')),
-        ('TEXTCOLOR', (1,0), (1,-1), dark),
-        ('ROWBACKGROUNDS', (0,0), (-1,-1), [light_gray, colors.white]),
-        ('TOPPADDING', (0,0), (-1,-1), 5),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-        ('LEFTPADDING', (0,0), (-1,-1), 8),
-        ('GRID', (0,0), (-1,-1), 0.5, mid_gray),
-        ('ROUNDEDCORNERS', [4]),
-    ]))
-    story.append(info_table)
-    
-    # ── COMMENTAIRE ──
-    if client_info.get('commentaire'):
-        story.append(Paragraph('COMMENTAIRE', section_style))
-        story.append(Paragraph(client_info['commentaire'], value_style))
-    
-    story.append(Spacer(1, 0.3*cm))
-    story.append(HRFlowable(width='100%', thickness=1, color=mid_gray))
-    
-    # ── ORDER ──
-    story.append(Paragraph('RÉFÉRENCES COMMANDÉES', section_style))
-    
-    optic_items = [i for i in order if i.get('source') == 'optic']
-    sun_items   = [i for i in order if i.get('source') == 'sun']
-    total_units = sum(i['qty'] for i in order)
-    
-    def make_order_table(items, label):
-        if not items: return
-        story.append(Paragraph(label, ParagraphStyle('cat', fontSize=9, fontName='Helvetica-Bold',
-                                                       textColor=dark, spaceBefore=8, spaceAfter=4)))
-        rows = [['Réf. courte', 'Réf. complète', 'Qté']]
-        for item in items:
-            ref_short = format_ref_short(item['name'])
-            rows.append([ref_short, item['name'], str(item['qty'])])
-        
-        t = Table(rows, colWidths=[3.5*cm, 11*cm, 2.5*cm])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), orange),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,-1), 9),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, light_gray]),
-            ('ALIGN', (2,0), (2,-1), 'CENTER'),
-            ('TOPPADDING', (0,0), (-1,-1), 5),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-            ('LEFTPADDING', (0,0), (-1,-1), 8),
-            ('GRID', (0,0), (-1,-1), 0.5, mid_gray),
-        ]))
-        story.append(t)
-    
-    make_order_table(optic_items, '👓 OPTIQUE')
-    make_order_table(sun_items, '🕶️ SOLAIRE')
-    
-    # ── TOTAL ──
-    story.append(Spacer(1, 0.4*cm))
-    total_data = [['TOTAL', f"{len(order)} références", f"{total_units} unités"]]
-    total_table = Table(total_data, colWidths=[3.5*cm, 8*cm, 5.5*cm])
-    total_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), dark),
-        ('TEXTCOLOR', (0,0), (-1,-1), colors.white),
-        ('FONTNAME', (0,0), (-1,-1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 11),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('TOPPADDING', (0,0), (-1,-1), 8),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-    ]))
-    story.append(total_table)
-    
-    # ── FOOTER ──
-    story.append(Spacer(1, 0.5*cm))
-    story.append(HRFlowable(width='100%', thickness=1, color=mid_gray))
-    story.append(Paragraph('Alysun Glasses · michael@alysunglasses.com · alysunglasses.com',
-                             ParagraphStyle('footer', fontSize=8, fontName='Helvetica',
-                                             textColor=colors.HexColor('#8a7f6e'), alignment=TA_CENTER,
-                                             spaceBefore=8)))
-    
-    doc.build(story)
-    buf.seek(0)
-    return buf.read()
-
-def send_email(client_info, pdf_bytes, txt_content, order):
-    """Send recap email"""
-    msg = MIMEMultipart()
-    msg['From'] = GMAIL_USER
-    msg['To'] = RECIPIENT_EMAIL
-    msg['Subject'] = f"Bon de visite — {client_info.get('magasin', 'Client')} — {datetime.now().strftime('%d/%m/%Y')}"
-    
-    # Body
-    total_units = sum(i['qty'] for i in order)
-    body = f"""Bonjour Michael,
-
-Voici le récap de ta visite chez {client_info.get('magasin', '—')} ({client_info.get('societe', '—')}).
-
-• {len(order)} références commandées
-• {total_units} unités au total
-• Date : {datetime.now().strftime('%d/%m/%Y à %H:%M')}
-
-Le bon de visite complet est en pièce jointe (PDF + TXT).
-
-Alysun Glasses
-"""
-    msg.attach(MIMEText(body, 'plain'))
-    
-    # PDF attachment
-    pdf_part = MIMEBase('application', 'pdf')
-    pdf_part.set_payload(pdf_bytes)
-    encoders.encode_base64(pdf_part)
-    pdf_part.add_header('Content-Disposition', f'attachment; filename="bon_visite_{client_info.get("magasin","client").replace(" ","_")}_{datetime.now().strftime("%Y%m%d")}.pdf"')
-    msg.attach(pdf_part)
-    
-    # TXT attachment
-    txt_part = MIMEBase('text', 'plain')
-    txt_part.set_payload(txt_content.encode('utf-8'))
-    encoders.encode_base64(txt_part)
-    txt_part.add_header('Content-Disposition', f'attachment; filename="bon_visite_{client_info.get("magasin","client").replace(" ","_")}_{datetime.now().strftime("%Y%m%d")}.txt"')
-    msg.attach(txt_part)
-    
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD.replace(' ', ''))
-        server.send_message(msg)
-
+# ── SIRENE ────────────────────────────────────────────────────────────────
 @app.route('/sirene', methods=['GET'])
 def search_sirene():
-    """Search French company by name or SIRET"""
     q = request.args.get('q', '').strip()
     if not q: return jsonify({"error": "Query required"}), 400
     import urllib.request, urllib.parse, json as json_mod
@@ -681,7 +416,10 @@ def search_sirene():
             siege = r.get('siege', {})
             siret = siege.get('siret', '')
             siren = r.get('siren', '')
-            tva = f"FR{(12 + 3 * (int(siren) % 97)) % 97:02d}{siren}" if siren else ''
+            try:
+                tva = f"FR{(12 + 3 * (int(siren) % 97)) % 97:02d}{siren}" if siren else ''
+            except:
+                tva = ''
             adresse_parts = [
                 siege.get('numero_voie',''), siege.get('type_voie',''),
                 siege.get('libelle_voie',''), siege.get('code_postal',''),
@@ -693,45 +431,88 @@ def search_sirene():
                 'siret': siret,
                 'tva': tva,
                 'adresse': adresse,
-                'forme': r.get('nature_juridique', ''),
             })
         return jsonify({"results": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/generate_recap', methods=['POST'])
-def generate_recap():
-    """Generate PDF + TXT recap and send by email"""
+# ── GENERATE TXT ──────────────────────────────────────────────────────────
+def format_ref_short(name):
+    name = re.sub(r'\s+', ' ', name.strip())
+    m = re.match(r'CL(\d+)\s+OPT\s+0?(\d+)', name)
+    if m: return f"{m.group(1)}-{int(m.group(2))}"
+    m = re.match(r'CL(\d+)\s+SG\s+(?:OPT\s+)?0?(\d+)', name)
+    if m: return f"{m.group(1)}-{int(m.group(2))}"
+    return name
+
+@app.route('/generate_txt', methods=['POST'])
+def generate_txt_route():
     try:
         data = request.json
-        client_info = data.get('client', {})
+        client = data.get('client', {})
         order = data.get('order', [])
-        
-        txt = generate_txt(client_info, order)
-        pdf = generate_pdf(client_info, order)
-        
-        # Send email
-        email_sent = False
-        try:
-            send_email(client_info, pdf, txt, order)
-            email_sent = True
-        except Exception as e:
-            print(f"Email error: {e}")
-        
-        # Return ZIP with PDF + TXT
-        zip_buf = io.BytesIO()
-        magasin = client_info.get('magasin', 'client').replace(' ', '_')
-        date_str = datetime.now().strftime('%Y%m%d')
-        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f'bon_visite_{magasin}_{date_str}.pdf', pdf)
-            zf.writestr(f'bon_visite_{magasin}_{date_str}.txt', txt.encode('utf-8'))
-        zip_buf.seek(0)
-        
-        response = send_file(zip_buf, mimetype='application/zip',
-                             as_attachment=True, download_name=f'recap_{magasin}_{date_str}.zip')
-        response.headers['X-Email-Sent'] = str(email_sent)
-        return response
-        
+
+        lines = []
+        lines.append("=" * 50)
+        lines.append("     BON DE VISITE — ALYSUN GLASSES")
+        lines.append("=" * 50)
+        lines.append(f"Date : {datetime.now().strftime('%d/%m/%Y a %H:%M')}")
+        lines.append("")
+        lines.append("-- INFORMATIONS CLIENT --")
+        lines.append(f"Magasin  : {client.get('magasin', '—')}")
+        lines.append(f"Societe  : {client.get('societe', '—')}")
+        lines.append(f"SIRET    : {client.get('siret', '—')}")
+        lines.append(f"TVA      : {client.get('tva', '—')}")
+        lines.append(f"Adresse  : {client.get('adresse', '—')}")
+        lines.append(f"Email    : {client.get('email', '—')}")
+        if client.get('commentaire'):
+            lines.append("")
+            lines.append("-- COMMENTAIRE --")
+            lines.append(client['commentaire'])
+        lines.append("")
+        lines.append("-- REFERENCES COMMANDEES --")
+
+        optic = [i for i in order if i.get('source') == 'optic']
+        sun   = [i for i in order if i.get('source') == 'sun']
+
+        if optic:
+            lines.append("")
+            lines.append("OPTIQUE :")
+            for item in optic:
+                ref = format_ref_short(item['name'])
+                lines.append(f"  {ref} x{item['qty']}   ({item['name']})")
+
+        if sun:
+            lines.append("")
+            lines.append("SOLAIRE :")
+            for item in sun:
+                ref = format_ref_short(item['name'])
+                lines.append(f"  {ref} x{item['qty']}   ({item['name']})")
+
+        total_refs = len(order)
+        total_units = sum(i['qty'] for i in order)
+        lines.append("")
+        lines.append(f"TOTAL : {total_refs} references · {total_units} unites")
+        lines.append("=" * 50)
+        lines.append("Alysun Glasses · michael@alysunglasses.com")
+        lines.append("=" * 50)
+
+        txt = "\n".join(lines)
+
+        magasin = client.get('magasin', 'client').replace(' ', '_')
+        date_str = datetime.now().strftime('%Y%m%d_%H%M')
+        filename = f"bon_visite_{magasin}_{date_str}.txt"
+
+        return send_file(
+            io.BytesIO(txt.encode('utf-8')),
+            mimetype='text/plain',
+            as_attachment=True,
+            download_name=filename
+        )
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
