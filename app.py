@@ -344,6 +344,34 @@ def process():
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
+
+@app.route('/sirene', methods=['GET'])
+def search_sirene():
+    q = request.args.get('q', '').strip()
+    if not q: return jsonify({"error": "Query required"}), 400
+    import urllib.request, urllib.parse, json as json_mod
+    try:
+        encoded = urllib.parse.quote(q)
+        url = f"https://recherche-entreprises.api.gouv.fr/search?q={encoded}&limite=5"
+        req = urllib.request.Request(url, headers={'User-Agent': 'AlysunGlasses/1.0'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json_mod.loads(r.read().decode('utf-8'))
+        results = []
+        for r in data.get('results', []):
+            siege = r.get('siege', {})
+            siret = siege.get('siret', '')
+            siren = r.get('siren', '')
+            try:
+                tva = f"FR{(12 + 3 * (int(siren) % 97)) % 97:02d}{siren}" if siren else ''
+            except:
+                tva = ''
+            adresse_parts = [siege.get('numero_voie',''), siege.get('type_voie',''), siege.get('libelle_voie',''), siege.get('code_postal',''), siege.get('libelle_commune','')]
+            adresse = ' '.join(p for p in adresse_parts if p).strip()
+            results.append({'nom': r.get('nom_complet', ''), 'siret': siret, 'tva': tva, 'adresse': adresse})
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
