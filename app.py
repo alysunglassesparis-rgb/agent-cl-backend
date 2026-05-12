@@ -177,15 +177,21 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N'):
                 for item in zbase.namelist():
                     if item.endswith('/'): continue
                     data = zbase.read(item)
-                    # Re-inject drawing tag if openpyxl dropped it
+                    # Re-inject drawing tag ONLY in sheets that had it originally
                     if re.match(r'xl/worksheets/sheet\d+\.xml$', item) and drawing_tag:
-                        xml = data.decode('utf-8')
-                        if '<drawing' not in xml:
-                            if 'xmlns:r=' not in xml:
-                                xml = xml.replace('<worksheet xmlns=',
-                                    '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns=')
-                            xml = xml.replace('</worksheet>', drawing_tag + '</worksheet>')
-                            data = xml.encode('utf-8')
+                        # Check if THIS specific sheet had a drawing in the original
+                        orig_item_xml = ''
+                        try:
+                            orig_item_xml = zorig.read(item).decode('utf-8')
+                        except: pass
+                        if orig_item_xml and '<drawing' in orig_item_xml:
+                            xml = data.decode('utf-8')
+                            if '<drawing' not in xml:
+                                if 'xmlns:r=' not in xml:
+                                    xml = xml.replace('<worksheet xmlns=',
+                                        '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns=')
+                                xml = xml.replace('</worksheet>', drawing_tag + '</worksheet>')
+                                data = xml.encode('utf-8')
                     # Skip old sheet rels (replaced below)
                     if re.match(r'xl/worksheets/_rels/sheet\d+\.xml\.rels$', item) and orig_sheet_rels:
                         continue
