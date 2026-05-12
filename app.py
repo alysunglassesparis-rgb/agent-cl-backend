@@ -76,7 +76,7 @@ def extract_image_row_mapping(z):
             for m in re.finditer(r'Id="([^"]+)"[^>]+Target="([^"]+)"', rels_xml):
                 rel_map[m.group(1)] = m.group(2).replace('../', 'xl/')
             anchors = re.findall(
-                r'<xdr:oneCellAnchor>.*?<xdr:row>(\d+)</xdr:row>.*?r:embed="([^"]+)".*?</xdr:oneCellAnchor>',
+                r'<xdr:oneCellAnchor[^>]*>.*?<xdr:row>(\d+)</xdr:row>.*?r:embed="([^"]+)".*?</xdr:oneCellAnchor>',
                 drawing_xml, re.DOTALL)
             for row_str, rid in anchors:
                 row = int(row_str) + 1
@@ -131,39 +131,74 @@ def get_qty_col_letter(catalogue):
                 return result
     return 'T'
 
-def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='T'):
-    updates = {f"{qty_col_letter}{row}": qty for row, qty in row_updates.items()}
-    output = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zin:
-        sheet_files = sorted([f for f in zin.namelist() if re.match(r'xl/worksheets/sheet\d+\.xml$', f)])
-        target = sheet_files[0] if sheet_files else None
-        with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.namelist():
-                data = zin.read(item)
-                if item == target and updates:
-                    xml = data.decode('utf-8')
-                    for coord, qty in updates.items():
-                        qs = str(int(qty) if isinstance(qty, float) and qty == int(qty) else qty)
-                        pat = rf'<c r="{coord}"([^>]*)>(.*?)</c>'
-                        def repl(m, q=qs, c=coord):
-                            attrs = re.sub(r'\s*t=["\'][^"\']*["\']', '', m.group(1))
-                            return f'<c r="{c}"{attrs}><v>{q}</v></c>'
-                        if re.search(pat, xml, re.DOTALL):
-                            xml = re.sub(pat, repl, xml, flags=re.DOTALL)
-                        else:
-                            rn = re.search(r'\d+', coord).group()
-                            rp = rf'(<row r="{rn}"[^>]*>)(.*?)(</row>)'
-                            def ins(m, c=coord, q=qs):
-                                return f'{m.group(1)}{m.group(2)}<c r="{c}"><v>{q}</v></c>{m.group(3)}'
-                            xml = re.sub(rp, ins, xml, flags=re.DOTALL)
-                    data = xml.encode('utf-8')
-                if item == 'xl/workbook.xml':
-                    wbxml = data.decode('utf-8')
-                    wbxml = re.sub(r'<calcPr[^/]*/>', '<calcPr fullCalcOnLoad="1"/>', wbxml)
-                    if '<calcPr' not in wbxml:
-                        wbxml = wbxml.replace('</workbook>', '<calcPr fullCalcOnLoad="1"/></workbook>')
-                    data = wbxml.encode('utf-8')
-                zout.writestr(item, data)
+def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N'):
+    """Write quantities with openpyxl (proper formula recalc) + preserve images"""
+    if not row_updates:
+        return xlsx_bytes
+    
+    # Convert letter to column index
+    col_idx = 0
+    for ch in qty_col_letter.upper():
+        col_idx = col_idx * 26 + (ord(ch) - ord('A') + 1)
+    
+    # Step 1: openpyxl writes quantities
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb['NuORDER Order Data'] if 'NuORDER Order Data' in wb.sheetnames else wb.active
+    for row_num, qty in row_updates.items():
+        ws.cell(row=row_num, column=col_idx).value = qty
+    buf = io.BytesIO()
+    wb.save(buf)
+    openpyxl_bytes = buf.getvalue()
+
+    # Step 2: preserve images from original
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zorig:
+        orig_files = set(f for f in zorig.namelist() if not f.endswith('/'))
+        media_files = [f for f in orig_files if 'xl/media/' in f]
+        drawing_xml_files = [f for f in orig_files if re.match(r'xl/drawings/drawing\d+\.xml$', f)]
+        drawing_rels_files = [f for f in orig_files if re.match(r'xl/drawings/_rels/drawing\d+\.xml\.rels$', f)]
+
+        # Get drawing tag from original sheet
+        orig_ws_files = sorted([f for f in orig_files if re.match(r'xl/worksheets/sheet\d+\.xml$', f)])
+        drawing_tag = None
+        orig_sheet_rels = {}
+        for wsf in orig_ws_files:
+            xml = zorig.read(wsf).decode('utf-8')
+            m = re.search(r'<drawing[^/]*/>', xml)
+            if m:
+                drawing_tag = m.group()
+                rels_file = wsf.replace('xl/worksheets/', 'xl/worksheets/_rels/') + '.rels'
+                if rels_file in orig_files:
+                    orig_sheet_rels[rels_file] = zorig.read(rels_file)
+
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(openpyxl_bytes), 'r') as zbase:
+            existing = set(f for f in zbase.namelist() if not f.endswith('/'))
+            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zfinal:
+                for item in zbase.namelist():
+                    if item.endswith('/'): continue
+                    data = zbase.read(item)
+                    # Re-inject drawing tag if openpyxl dropped it
+                    if re.match(r'xl/worksheets/sheet\d+\.xml$', item) and drawing_tag:
+                        xml = data.decode('utf-8')
+                        if '<drawing' not in xml:
+                            if 'xmlns:r=' not in xml:
+                                xml = xml.replace('<worksheet xmlns=',
+                                    '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns=')
+                            xml = xml.replace('</worksheet>', drawing_tag + '</worksheet>')
+                            data = xml.encode('utf-8')
+                    # Skip old sheet rels (replaced below)
+                    if re.match(r'xl/worksheets/_rels/sheet\d+\.xml\.rels$', item) and orig_sheet_rels:
+                        continue
+                    zfinal.writestr(item, data)
+
+                # Add original sheet rels
+                for rels_file, rels_content in orig_sheet_rels.items():
+                    zfinal.writestr(rels_file, rels_content)
+                # Add media and drawings
+                for item in media_files + drawing_xml_files + drawing_rels_files:
+                    if item not in existing:
+                        zfinal.writestr(item, zorig.read(item))
+
     return output.getvalue()
 
 def load_from_disk():
