@@ -209,6 +209,19 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N'):
 
 def load_from_disk():
     global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
+    
+    # Check repo directory first (files committed to GitHub)
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_optic = os.path.join(repo_dir, 'optic.xlsx')
+    repo_sun   = os.path.join(repo_dir, 'sun.xlsx')
+    
+    # Use repo files if they exist and data dir files don't
+    for src, dst in [(repo_optic, OPTIC_PATH), (repo_sun, SUN_PATH)]:
+        if os.path.exists(src) and not os.path.exists(dst):
+            import shutil
+            shutil.copy2(src, dst)
+            print(f"Copied {src} -> {dst}")
+    
     if os.path.exists(OPTIC_PATH):
         try:
             with open(OPTIC_PATH, 'rb') as f: OPTIC_BYTES = f.read()
