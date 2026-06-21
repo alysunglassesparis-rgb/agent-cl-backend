@@ -131,21 +131,28 @@ def get_qty_col_letter(catalogue):
                 return result
     return 'T'
 
-def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N'):
+def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N', highlight_rows=None):
     """Write quantities with openpyxl (proper formula recalc) + preserve images"""
-    if not row_updates:
+    if not row_updates and not highlight_rows:
         return xlsx_bytes
-    
+
     # Convert letter to column index
     col_idx = 0
     for ch in qty_col_letter.upper():
         col_idx = col_idx * 26 + (ord(ch) - ord('A') + 1)
-    
+
     # Step 1: openpyxl writes quantities
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     ws = wb['NuORDER Order Data'] if 'NuORDER Order Data' in wb.sheetnames else wb.active
     for row_num, qty in row_updates.items():
         ws.cell(row=row_num, column=col_idx).value = qty
+    # Highlight selected rows in yellow (whole row)
+    if highlight_rows:
+        YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        max_col = ws.max_column or col_idx
+        for row_num in highlight_rows:
+            for c in range(1, max_col + 1):
+                ws.cell(row=row_num, column=c).fill = YELLOW_FILL
     buf = io.BytesIO()
     wb.save(buf)
     openpyxl_bytes = buf.getvalue()
@@ -209,19 +216,6 @@ def patch_xlsx_quantities(xlsx_bytes, row_updates, qty_col_letter='N'):
 
 def load_from_disk():
     global CATALOGUE_OPTIC, CATALOGUE_SUN, OPTIC_BYTES, SUN_BYTES
-    
-    # Check repo directory first (files committed to GitHub)
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_optic = os.path.join(repo_dir, 'optic.xlsx')
-    repo_sun   = os.path.join(repo_dir, 'sun.xlsx')
-    
-    # Use repo files if they exist and data dir files don't
-    for src, dst in [(repo_optic, OPTIC_PATH), (repo_sun, SUN_PATH)]:
-        if os.path.exists(src) and not os.path.exists(dst):
-            import shutil
-            shutil.copy2(src, dst)
-            print(f"Copied {src} -> {dst}")
-    
     if os.path.exists(OPTIC_PATH):
         try:
             with open(OPTIC_PATH, 'rb') as f: OPTIC_BYTES = f.read()
@@ -292,19 +286,25 @@ def generate():
     order = data.get('order', [])
     updates_optic = {}
     updates_sun = {}
+    highlight_optic = set()
+    highlight_sun = set()
     lookup_optic = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_OPTIC or [])}
     lookup_sun   = {re.sub(r'\s+', ' ', i['name']).upper(): i['row'] for i in (CATALOGUE_SUN or [])}
     for item in order:
         name = re.sub(r'\s+', ' ', item['name']).upper()
         qty = item['qty']
         if item['source'] == 'optic' and name in lookup_optic:
-            updates_optic[lookup_optic[name]] = qty
+            row = lookup_optic[name]
+            updates_optic[row] = qty
+            if item.get('highlight'): highlight_optic.add(row)
         elif item['source'] == 'sun' and name in lookup_sun:
-            updates_sun[lookup_sun[name]] = qty
+            row = lookup_sun[name]
+            updates_sun[row] = qty
+            if item.get('highlight'): highlight_sun.add(row)
     qty_col_optic = get_qty_col_letter(CATALOGUE_OPTIC)
     qty_col_sun   = get_qty_col_letter(CATALOGUE_SUN)
-    patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic, qty_col_optic)
-    patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun, qty_col_sun)
+    patched_optic = patch_xlsx_quantities(OPTIC_BYTES, updates_optic, qty_col_optic, highlight_optic)
+    patched_sun   = patch_xlsx_quantities(SUN_BYTES, updates_sun, qty_col_sun, highlight_sun)
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('commande_optique.xlsx', patched_optic)
