@@ -8,10 +8,12 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 CORS(app, expose_headers=['X-Found-Optic','X-Found-Sun','X-Not-Found','X-Red-Refs'])
 
+APP_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', '/tmp/cl_data')
 os.makedirs(DATA_DIR, exist_ok=True)
-OPTIC_PATH = os.path.join(DATA_DIR, 'optic.xlsx')
-SUN_PATH   = os.path.join(DATA_DIR, 'sun.xlsx')
+# Prefer uploaded files in DATA_DIR; fall back to files bundled in the repo
+OPTIC_PATH = os.path.join(DATA_DIR, 'optic.xlsx') if os.path.exists(os.path.join(DATA_DIR, 'optic.xlsx')) else os.path.join(APP_DIR, 'optic.xlsx')
+SUN_PATH   = os.path.join(DATA_DIR, 'sun.xlsx')   if os.path.exists(os.path.join(DATA_DIR, 'sun.xlsx'))   else os.path.join(APP_DIR, 'sun.xlsx')
 
 CATALOGUE_OPTIC = None
 CATALOGUE_SUN   = None
